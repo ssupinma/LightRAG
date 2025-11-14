@@ -62,6 +62,53 @@ asyncio.run(main())
 
 印出的 `track_id` 可用來查閱背景任務的執行狀態或與日誌進行對照。
 
+若要追蹤處理進度，可在稍後呼叫 `await rag.aget_docs_by_track_id(track_id)` 取得所有同批文件的狀態與產出段落，回傳值以文件 ID 為鍵、`DocProcessingStatus` 為內容，會連同 `file_path`、錯誤訊息等資訊一併提供。【F:lightrag/lightrag.py†L3606-L3635】【F:lightrag/kg/json_doc_status_impl.py†L126-L169】
+
+### 1.3 `ainsert` 背後的處理流程
+
+`rag.ainsert` 不只是把原始文字拆成多個檔案；它會把文件排入完整的索引管線。每份文件會先被切成 chunk，然後平行地：
+
+* 更新 `doc_status`，記錄 chunk 清單、來源檔案與處理時間戳記，方便後續追蹤。【F:lightrag/lightrag.py†L1820-L1833】
+* 呼叫 `chunks_vdb.upsert` 與 `text_chunks.upsert`，把 chunk 內容與中繼資料儲存到向量資料庫與文字儲存層。`chunks_vdb` 在 `upsert` 時會批次執行 embedding 計算，再將結果寫入儲存檔案，因此不需要額外手動觸發向量化。【F:lightrag/lightrag.py†L1834-L1845】【F:lightrag/kg/nano_vector_db_impl.py†L91-L133】
+* 等待上述動作完成後，再執行 `_process_extract_entities`，透過 LLM 從 chunk 中擷取實體與關係並寫回知識圖譜儲存體，完成整個索引流程。【F:lightrag/lightrag.py†L1852-L1859】【F:lightrag/operate.py†L2740-L2839】
+
+因此，`ainsert` 會完成分段、embedding、向量儲存與知識圖譜更新，而非僅僅把文本拆成兩個檔案。
+
+### 1.4 已預先插入分隔符的 Markdown 文件範例
+
+若手邊已有一份 `XYZ.md`，內容使用 `<<BREAK>>` 作為段落分隔，依下列方式即可一次完成切分、embedding 與資料庫寫入：
+
+```python
+import asyncio
+from pathlib import Path
+from lightrag.lightrag import LightRAG
+
+async def main() -> None:
+    rag = LightRAG()
+
+    # 讀取已含有分隔符的 Markdown 文件
+    source_path = Path("XYZ.md")
+    raw_markdown = source_path.read_text(encoding="utf-8")
+
+    track_id = await rag.ainsert(
+        input=raw_markdown,
+        split_by_character="<<BREAK>>",
+        split_by_character_only=True,
+        ids="xyz-md",
+        file_paths=str(source_path),
+    )
+    print("排程編號:", track_id)
+
+    # 可選：查詢本次任務的每個文件狀態與 chunk 細節
+    docs = await rag.aget_docs_by_track_id(track_id)
+    for doc_id, status in docs.items():
+        print(doc_id, status.status, len(status.chunks_list))
+
+asyncio.run(main())
+```
+
+程式會把 `XYZ.md` 的段落依 `<<BREAK>>` 分割，並交由同一套索引管線處理。每個 chunk 在 `chunks_vdb.upsert` 時會自動計算 embedding、儲存在共享的 NanoVectorDB 檔案裡，同時寫入 `text_chunks` 與 `doc_status` 以便追蹤來源與後續查詢。【F:lightrag/lightrag.py†L1834-L1859】【F:lightrag/kg/nano_vector_db_impl.py†L91-L133】之後的 `_process_extract_entities` 也會針對這些 chunk 執行知識圖譜抽取，確保文件在資料庫中可供語意檢索與圖譜分析。【F:lightrag/operate.py†L2740-L2839】如果需要檢查成果，可以藉由 `aget_docs_by_track_id` 取得 chunk ID、處理狀態或錯誤訊息。
+
 ## 2. 讓 REST API 支援特殊分隔符
 
 FastAPI 路由目前只接收文字與來源資訊，沒有暴露 `split_by_character`，因此透過現成 API 無法指定特殊分隔符。【F:lightrag/api/routers/document_routes.py†L205-L240】【F:lightrag/api/routers/document_routes.py†L1547-L1570】要在不更動核心模組的前提下加入支援，可依下列步驟修改 API 專案：
